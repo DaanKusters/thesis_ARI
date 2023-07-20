@@ -1,0 +1,446 @@
+---
+title: "simulation_neat"
+author: "Daan Kusters s2322064"
+date: "2023-07-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Load required libraries
+
+```{r}
+library(neuRosim)
+library(RNifti)
+library(mmand)
+library(plyr)
+library(dplyr)
+library(ARIbrain)
+library(pARI)
+library(sumSome)
+library(foreach)
+library(doParallel)
+```
+
+### Load parameter file
+
+```{r}
+fileloc = '/Users/daank/OneDrive/Documenten/Master Statistics and Data Science/Jaar 2/Thesis/R files/Results/n140/parameters_112.csv'
+params = read.csv(file=fileloc)
+
+head(params,5)
+```
+### Simulation functions
+
+```{r}
+# loads the pregenerated noise map for the specified parameters and seed and adds the specified smoothing, signal, etc.
+make_copes = function(param_row, seed_in){ 
+  snr = param_row$sig_noise_ratio
+  rad = param_row$radius
+  nsubj = param_row$n
+  fwhm = param_row$FWHM
+  smooth = param_row$smoothing
+  set.seed(seed_in)
+  dims = c(100,100,nsubj)
+  
+  load(file=paste0('/Users/daank/Downloads/extdata/simulations/noisemaps_big_n/fwhm', fwhm, '_seed', seed_in, '.Rdata'))
+  noise = noise[,,1:nsubj]
+  
+  # fading setting ensures that all clusters have similar activation patterns
+  activation = specifyregion(dim=dims[1:2], coord=dims[1:2]/2, radius=rad, form="sphere", fading=0.1*(3)^2/(rad)^2) 
+  activation_bin = activation > 0 # activation map used in other functions
+  
+  if(snr == 0){ # activation is cancelled by signal to noise ratio, so no scaling is required
+    activation_scaled = 0
+  }else{
+    activation_scaled = activation*snr/sqrt(dims[3])
+  }
+  brain = noise + array(activation_scaled, dim=dims)
+  if (smooth > 0){ # only apply Gaussian kernel if the smooth parameter is > 0 
+    brain_smooth = aaply(brain, 3, function(c) gaussianSmooth(c, sigma=c(smooth, smooth)))
+    brain_smooth = aperm(brain_smooth, c(2,3,1)) # fix dimensions so that nsubj is at the back again
+  } else brain_smooth = brain
+  
+  list(copes=brain_smooth, act_map=activation_bin)
+}
+
+# computes z scores for all voxels in the map based on the subjects' data
+comp_zmap = function(copes){
+  copes_dims = dim(copes)
+  copes_means = as.matrix(rowMeans(copes, dims=2))
+
+  temp = copes - array(copes_means, dim=copes_dims)
+  temp_sq = temp^2
+  temp_sq_sum = as.matrix(rowSums(temp_sq, dim=2))           
+  copes_sds = sqrt(temp_sq_sum/(copes_dims[3]-1))
+  
+  z_computed = copes_means/(copes_sds/sqrt(copes_dims[3]))
+  array(z_computed, dim=c(copes_dims[1:2],1))
+}
+
+
+# returns size of largest cluster in the cluster map, only used in RFT_perm()
+largest_cluster = function(cl_map){
+  ct = table(cl_map)
+  as.numeric(ct[length(ct)])
+}  
+
+
+# not used during simulations, only at the creation of the parameter data frame
+# the value 'k' is computed here, i.e. the minimum cluster size for RFT significance
+RFT_perm = function(fwhm, threshold=3.1, perms=10000){
+  set.seed(100)
+  noisemap = array(spatialnoise(dim=c(100,100), sigma=1, nscan=perms, method="gaussRF", FWHM=fwhm), dim=c(100,100,perms))
+  mclus = numeric(perms)
+  
+  # record largest cluster for each map
+  for(i in 1:perms) {
+    if(sum(abs(noisemap[,,i])>threshold)>1) { # cluster_threshold() needs at least two suprathreshold voxels
+      mclus[i] = largest_cluster(cluster_threshold(abs(noisemap[,,i])>threshold))
+    } else {
+      mclus[i] = 1
+    }
+  }
+  list(quant=quantile(mclus, 0.95), sizes=mclus)
+}
+
+# use parametric ARI to analyse the data
+do_ARI = function(zmap, clusters_in){
+  absmap = abs(zmap)
+  pmap = pnorm(absmap, lower.tail=F)*2
+  param_ARI = ARI(pmap, clusters_in, Statmap = zmap, silent=T)
+  param_ARI
+}
+
+# use permutation-improved ARI to analyse the data
+do_pARI = function(zmap, clusters_in, copes, seed_in){
+  set.seed(seed_in)
+  use_mask = array(1, dim=c(1,dim(copes)[1:2],1))
+  cope_list = make_cope_list(copes, 'pARI')
+  perm_ARI = pARIbrain_custom(cope_list,clusters=clusters_in, B=1000, mask=use_mask, imgdim=c(dim(copes)[1:2], 1), silent=T)
+  perm_ARI$out
+}
+
+# use ARI with sum test as local test (HMP) to analyse the data. 
+do_HMP = function(copes, clusters_in, seed_in){
+  cope_list = list()
+  for (i in 1:dim(copes)[3]){ # make_cope_list() does not work, so copes are put in list this way
+    cope_list[[i]] = array(copes[,,i], dim=c(100,100,1))
+  }
+  pvals = brainPvals(copes=cope_list, seed=seed_in, type="harmonic")
+  
+  set.seed(seed_in)
+  HMP_out = brainAnalysis(sumBrain = pvals, clusters = clusters_in, nMax=200, silent=T) 
+  HMP_out$summary
+}
+
+# makes cluster map based on z map, minimum cluster size and original activation location
+# outputs cluster map containing at most 4 clusters with numbers: 1000, 999, 1, 0
+make_clusters = function(zmap, min_size, act_map){
+  absmap = abs(zmap)
+  if (sum(absmap>3.1)<2){ # cluster_threshold() needs at least two suprathreshold voxels
+    clstr = array(0, dim=dim(zmap))
+  }else{
+    clstr = cluster_threshold(absmap>3.1)
+  }
+  
+  clstr_table = table(clstr)
+  large_enough = clstr_table[clstr_table>min_size] # threshold with cluster size > k
+  clstr[clstr %in% as.numeric(names(large_enough)) == F] = 0 # set clusters smaller than k to 0
+  
+  # join all voxels that are located in the true activation area and in RFT significant clusters 
+  clstr[(clstr[,,1] != 0) & (act_map)] = 1000   #     in RFT sign cluster and in activ area
+  clstr[(clstr[,,1] != 1000) & (act_map)] = 999 # not in RFT sign cluster and in activ area
+  clstr[(clstr[,,1] < 999) & (clstr[,,1] != 0)& (act_map == F)] = 1  # not in activ area, in RFT sign cluster
+  clstr[clstr[,,1] < 1] = 0                     # not in activ area, not in RFT sign cluster 
+  clstr
+}
+
+# main function for carrying out simulations. collects results and saves them as csv files
+run_simul = function(param_df, rows_to_run, method='ARI', cores_minus=2){
+  print(paste('Started simulations at', format(Sys.time(), "%d-%m-%Y %X"), sep=' '))
+  maploc = '/Users/daank/Downloads/extdata/simulations/'
+  
+  # initialise parallel computing
+  cores = detectCores()
+  cl = makeCluster(cores[1]-cores_minus) # cores_minus is how many cores should not be used 
+  # functions that are used in the parallel part
+  func_names= c("summary_perm_roi", "rowVariance", "pARIbrain_custom", "oneSamplePar", 
+                "make_copes", "do_ARI", "do_pARI", "comp_zmap", "make_cope_list", "make_clusters", 
+                "do_HMP")
+  clusterExport(cl, func_names) # these functions are called in the parallel part
+
+  for (i in rows_to_run){
+    starttime = Sys.time()
+    
+    out_df = repeat_row_parallel(param_df[i,'replicates'], param_df[i,1:ncol(param_df)], method, func_names, cl)
+    
+    for (parcol in 1:ncol(param_df)){
+      out_df[,colnames(param_df)[parcol]] = param_df[i,parcol] # fill output with parameter values in the correct columns
+    }
+    
+    partext = paste0(method, '_par') # indicate parallel execution, although the results are identical to sequential execution
+    if (method =='HMP'){
+       partext = paste0(partext, '_200')
+    }
+    
+    write.csv(out_df, file=paste0(maploc, partext, '_simul_row_', i, '_bign140.csv'), row.names = F) 
+    elapsed = difftime(Sys.time(), starttime, units = "auto")
+    print(paste(format(Sys.time(), "%X"), '- row', i, 'took', round(elapsed[[1]], 2), attr(elapsed, 'units')))
+  }
+  stopCluster(cl)
+}
+
+# only executed once, precomputes the noisemaps required by make_copes() to save time
+make_noisemaps = function(max_n, fwhms){
+  for (fwhm in fwhms){
+    for (s in 1:100){
+      thisseed = 1000 + s
+      set.seed(thisseed)
+      noise = array(spatialnoise(dim=c(100,100), sigma=1, nscan=max_n, method="gaussRF", FWHM=fwhm), 
+                    dim=c(100,100,max_n))
+      save(noise, file=paste0('/Users/daank/Downloads/extdata/simulations/noisemaps_big_n/fwhm', 
+                              fwhm, '_seed', thisseed, '.Rdata'))
+    }
+  }
+}
+
+# used by do_pARI(), but not by do_HMP(). puts copes into a list as is required by the pARI function
+make_cope_list = function(copes, method){
+  cope_list = list()
+  for (i in 1:dim(copes)[3]){
+    thiscope = copes[,,i]
+    dim(thiscope) = c(dim(thiscope), 1, 1) 
+    cope_list[[i]] = asNifti(thiscope) 
+  }
+  cope_list
+}
+
+# function that contains the parallel computing part. performs the spacified number of replications of each parameter row
+repeat_row_parallel = function(reps, param_row, method='ARI', func_names=NULL, parallel_cluster=NULL){ 
+  registerDoParallel(parallel_cluster)
+  rad = param_row$radius
+  min_size  = param_row$k
+
+  saved_output = data.frame('run_at'=rep(0, reps),
+                            'repl_num'=0, 
+                            'cl1000_TDP'=0, 
+                            'cl1000_size'=0,
+                            'cl999_TDP'=0, 
+                            'cl999_size'=0,
+                            'cl1_TDP'=0,
+                            'cl1_size'=0, 
+                            'cl0_TDP'=0,
+                            'cl0_size'=0)
+  run_at = format(Sys.time(), "%d-%m-%Y %X")
+  
+  par_out = NULL
+  
+  par_out = foreach(
+    repit=1:reps, .combine=rbind, .export=func_names, .packages=c('neuRosim', 'RNifti', 'mmand', 'plyr', 'ARIbrain', 'pARI', 'sumSome')
+  ) %dopar% {
+    
+    copes_in = make_copes(param_row, 1000+repit)
+    copes = copes_in$copes
+    actmap = copes_in$act_map
+    z_map = comp_zmap(copes)
+    clusters_in = make_clusters(z_map, min_size, actmap)
+    if (method == 'ARI'){
+      method_output = do_ARI(z_map, clusters_in) # seeds: 1001 up to 1000+replications
+    } else if (method == 'pARI'){
+      method_output = do_pARI(z_map, clusters_in, copes, 1000+repit)
+    } else if (method == 'HMP'){
+      method_output = do_HMP(copes, clusters_in, 1000+repit)
+    }
+    
+    newrow = c(run_at, repit, rep(NA, (ncol(saved_output)-2)))
+    colind = 3
+    
+    for (clname in c('cl1000', 'cl999', 'cl1', 'cl0')){ # extracts the relevant information from the method outputs
+      if (method %in% c('ARI','pARI', 'HMP')){
+        if(clname %in% rownames(method_output)){
+          TDP = method_output[clname, ifelse(method == 'HMP', 'TDP', 'ActiveProp')]
+          size = method_output[clname, ifelse(method == 'HMP', 'size', 'Size')]
+        } else { 
+          TDP = -1
+          size = -1
+        }
+      }else stop('method not recognized in function repeat_row_parallel()')
+      newrow[colind:(colind + 1)] = c(TDP, size)
+      colind = colind + 2
+    }
+    newrow # this is one row, all rows of one replication set are combined using rbind(), as specified in foreach() call
+  }
+  par_out_df = as.data.frame(par_out) # par_out is the combined rows of all replications
+  out_names = c('run_at', 'repl_num', 'cl1000_TDP', 'cl1000_size', 'cl999_TDP', 
+                'cl999_size', 'cl1_TDP', 'cl1_size', 'cl0_TDP', 'cl0_size')
+  colnames(par_out_df) = out_names
+  rownames(par_out_df) = NULL
+  saved_output = par_out_df
+  
+  for (numcol in colnames(saved_output[,-1])){ # force all columns except the date time column to numeric type
+    saved_output[,numcol] = as.numeric(saved_output[,numcol])
+  }
+  return(saved_output)
+}
+
+# original pARIbrain function except that imgdim is added as input. Originally it was hardcoded at c(91,109,91)
+pARIbrain_custom = function (copes, thr = NULL, mask = NULL, alpha = 0.05, clusters = NULL, 
+                             alternative = "two.sided", summary_stat = c("max", "center-of-mass"), 
+                             silent = FALSE, family = "simes", delta = 0, B = 1000, rand = FALSE, 
+                             iterative = FALSE, approx = TRUE, ncomb = 100, step.down = FALSE, 
+                             max.step = 10, imgdim=c(91, 109, 91), ...) 
+{
+  "%ni%" <- Negate("%in%")
+  val_alpha = sapply(c(1:B), function(x) (B - x)/B)
+  if (!(alpha %in% val_alpha)) {
+    stop("please insert valid values for alpha and B")
+  }
+  family_set <- c("simes", "aorc", "beta", "higher.criticism")
+  alternative_set <- c("two.sided", "greater", "lower")
+  family <- match.arg(tolower(family), family_set)
+  alternative <- match.arg(tolower(alternative), alternative_set)
+  if (is.character(mask)) {
+    mask = readNifti(mask)
+  }
+  if (!is.list(copes)) {
+    stop("Please insert the list of copes as list class object")
+  }
+  img_dims <- imgdim
+  img <- array(NA, c(img_dims, length(copes)))
+  for (sid in 1:length(copes)) {
+    img[, , , sid] <- copes[[sid]]
+  }
+  scores <- matrix(img, nrow = prod(img_dims), ncol = length(copes))
+  scores[!mask, ] = NA
+  resO <- oneSamplePar(X = scores, alternative = alternative)
+  scores <- scores[which(mask == 1), ]
+  res <- signTest(X = scores, B = B, alternative = alternative, 
+                  rand = rand, ...)
+  pvalues <- cbind(res$pv, res$pv_H0)
+  Statmap = array(data = resO$Test, dim = img_dims)
+  Statmap[!mask] = 0
+  rm(res)
+  rm(scores)
+  rm(copes)
+  rm(img)
+  if (is.null(clusters) & !is.null(thr)) {
+    clusters <- cluster_threshold(Statmap > thr)
+  }
+  if (!is.null(clusters) & is.null(thr)) {
+    if (is.character(clusters)) {
+      clusters = readNifti(clusters)
+    }
+    else {
+      clusters = get_array(clusters)
+    }
+    clusters = array(clusters, dim(clusters))
+  }
+  if (is.null(clusters) & is.null(thr) & !is.null(mask)) {
+    clusters <- array(mask, dim(mask))
+  }
+  if (is.null(clusters) & is.null(thr) & is.null(mask)) {
+    stop("Please insert mask, threshold value or cluster map")
+  }
+  summary_stat = match.arg(summary_stat, c("max", "center-of-mass"))
+  mask = which(mask != 0)
+  lambda <- lambdaOpt(pvalues = pvalues, family = family, alpha = alpha, 
+                      delta = delta, step.down = step.down, max.step = max.step)
+  if (lambda == 0) {
+    lambda <- 0.05
+  }
+  cvOpt = criticalVector(pvalues = pvalues, family = family, 
+                         alpha = alpha, lambda = lambda, delta = delta)
+  clstr_id = sort(unique(as.vector(clusters[mask])), decreasing = TRUE)
+  if (is.function(Statmap)) {
+    StatFun = Statmap
+  }
+  else {
+    StatFun <- function(ix) Statmap[ix]
+  }
+  clstr_id <- clstr_id[clstr_id != 0]
+  out = laply(clstr_id, function(i) {
+    ix = clusters == i
+    ix[-mask] = FALSE
+    cluster_ids = which(ix, arr.ind = TRUE)
+    cluster_ids = cbind(cluster_ids, Stat = StatFun(ix))
+    unlist(c(summary_perm_roi(cv = cvOpt, ix = ix[mask], 
+                              pvalues = pvalues, iterative = iterative, approx = approx, 
+                              ncomb = ncomb, family = family, delta = delta, alpha = alpha), 
+             summary_cluster(cluster_ids)[-1]))
+  })
+  if (!is.null(dim(out))) {
+    rownames(out) = paste("cl", sep = "", clstr_id)
+  }
+  if (!silent) 
+    print(out)
+  return(list(out = out, clusters = clusters))
+}
+
+# 'invisible' function from pARI package, needs to be made explicit because the pARIbrain_custom() function calls it
+# has not been altered
+oneSamplePar<- function(X,alternative = "two.sided"){
+  alternative_set <- c("two.sided", "greater", "lower")
+  n <- ncol(X)
+  m <- nrow(X)
+  
+  alternative <- match.arg(tolower(alternative), alternative_set)
+  rowV <- rowVariance(X)
+  
+  Test <- ifelse(rowV==0,0, rowMeans(X)/(sqrt((rowV)/n)))
+  pv <- switch(alternative, 
+               "two.sided" = 2*(pt(abs(Test), df = n-1, lower.tail=FALSE)),
+               "greater" = pt(Test, df = n-1, lower.tail=FALSE),
+               "lower" = 1-pt(Test, df = n-1, lower.tail=FALSE))
+  
+  res <- list(Test = Test, pv = pv)
+  
+  return(res)
+}
+
+# 'invisible' function from pARI package, needs to be made explicit because the pARIbrain_custom() function calls it
+# has not been altered
+rowVariance <- function (X,na.rm = TRUE) 
+{
+  sqr = function(X) X * X
+  n = rowSums(!is.na(X))
+  n[n <= 1] = NA
+  return(rowSums(sqr(X - rowMeans(X,na.rm = na.rm)), na.rm = na.rm)/(n - 1))
+}
+
+# 'invisible' function from pARI package, needs to be made explicit because the pARIbrain_custom() function calls it
+# has not been altered
+summary_perm_roi <- function(cv,ix,pvalues, iterative, approx, ncomb, ...){
+  idix <- which(ix)
+  p <- pvalues[idix,1]
+  Total = length(idix)
+  False_Null= dI(ix = idix,cv = cv,pvalues = pvalues, 
+                 iterative = iterative, approx = approx, ncomb = ncomb, ...)
+  True_Null=Total - False_Null
+  Active_Proportion= False_Null / Total
+  list(Size=Total,FalseNull=False_Null,TrueNull=True_Null,ActiveProp=Active_Proportion)
+}
+  
+# stops any running parallel clusters 
+unregister_dopar <- function() {
+  env <- foreach:::.foreachGlobals
+  rm(list=ls(name=env), pos=env)
+}
+```
+
+### Pregenerate all required maps
+
+Needs to be executed only once
+
+```{r}
+make_noisemaps(140,c(3,5))
+```
+
+### Example simulations for the parametric ARI method
+
+```{r}
+run_simul(params, 1:nrow(params), method='ARI', cores_minus=2)
+```
+
